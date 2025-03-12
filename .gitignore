@@ -26,3 +26,5 @@ go.work.sum
 
 # intellij
 .idea
+
+.DS_Store
