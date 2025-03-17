@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	startBlock = 4789178
-	endBlock   = 7833217
+	startBlock = 7817858 // first block involving 0x761d53b47334bee6612c0bd1467fb881435375b2 in a tx
+	endBlock   = 7920102 // latest block on sepolia at testing time
 	blockChunk = 10000
 	topic      = "0x3e54d0825ed78523037d00a81759237eb436ce774bd546993ee67a1b67b6e766"
 	address    = "0x761d53b47334bee6612c0bd1467fb881435375b2"
@@ -32,12 +32,16 @@ type Endpoint struct {
 }
 
 type LogEntry struct {
-	BlockHash         common.Hash
-	TransactionHashes map[common.Hash]uint
+	BlockHash       common.Hash
+	TransactionHash common.Hash
+	Data            []byte
+	BlockNumber     uint64
+	Index           uint
 }
 
-type BlockInfo struct {
+type LogBlockInfo struct {
 	Time             uint64
+	Data             []byte
 	TransactionsRoot common.Hash
 	StateRoot        common.Hash
 	ReceiptsRoot     common.Hash
@@ -45,17 +49,18 @@ type BlockInfo struct {
 }
 
 var endpoints = []Endpoint{ // fake endpoints
-	{URL: "http://sepolia-erigon-archive-node/", Latency: 0},
-	{URL: "http://sepolia-geth-archive-node/", Latency: 0},
-	{URL: "http://sepolia-reth-archive-node/", Latency: 0},
+	{URL: "http://sepolia-geth-archive-node.org", Latency: 0},
+	{URL: "http://sepolia-reth-archive-node.org", Latency: 0},
+	{URL: "http://sepolia-erigon-archive-node.org/", Latency: 0},
 }
 
 var logsQueue = make(chan LogEntry, 100)
-var blockInfoList = []BlockInfo{}
+var blockInfoList = []LogBlockInfo{}
 var blockInfoListMutex sync.Mutex
 var db *leveldb.DB
-var index uint64 = 1
+var index uint64 = 0
 var indexMutex sync.Mutex
+var sepoliaChainId *big.Int
 
 func main() {
 	// Open log file
@@ -68,6 +73,10 @@ func main() {
 	// Set log output to file
 	log.SetOutput(logFile)
 
+	// Set the sepolia chaindId
+	sepoliaChainId = new(big.Int)
+	sepoliaChainId.SetString("aa36a7", 16)
+
 	// Initialize LevelDB
 	db, err = leveldb.OpenFile("blockinfo.db", nil)
 	if err != nil {
@@ -76,7 +85,6 @@ func main() {
 	defer db.Close()
 
 	var wg sync.WaitGroup
-
 	wg.Add(2)
 	go publisher(&wg)
 	go subscriber(&wg)
@@ -119,30 +127,24 @@ func queryLogs(start, end int) {
 	updateLatency(endpoint, latency)
 
 	log.Printf("Fetched %d logs from %s in %s", len(logs), endpoint.URL, latency)
-	reduceLogs(logs)
+	putLogs(logs)
 }
 
-func reduceLogs(logs []types.Log) {
-	logMap := make(map[common.Hash]map[common.Hash]uint)
+// Adding eth_getLogs logs to the channel queue
+func putLogs(logs []types.Log) {
 
 	for _, logEntry := range logs {
-		if _, exists := logMap[logEntry.BlockHash]; !exists {
-			logMap[logEntry.BlockHash] = make(map[common.Hash]uint)
-		}
-		logMap[logEntry.BlockHash][logEntry.TxHash] = logEntry.Index
-	}
-
-	for blockHash, txMap := range logMap {
-		logsQueue <- LogEntry{BlockHash: blockHash, TransactionHashes: txMap}
-		log.Printf("Added log entry for block %s to queue", blockHash.Hex())
+		logsQueue <- LogEntry{BlockHash: logEntry.BlockHash, Data: logEntry.Data, BlockNumber: logEntry.BlockNumber, TransactionHash: logEntry.TxHash, Index: logEntry.Index}
+		log.Printf("Added log for block %d to queue", logEntry.BlockNumber)
 	}
 }
 
 func subscriber(wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// read from channel queue. It will continue reading for as long as there are objects in it.
 	for logEntry := range logsQueue {
-		log.Printf("Processing log entry for block %s", logEntry.BlockHash.Hex())
+		log.Printf("Processing log entry for block %d", logEntry.BlockNumber)
 		processLogEntry(logEntry)
 	}
 	log.Println("Finished processing log entries")
@@ -164,28 +166,36 @@ func processLogEntry(logEntry LogEntry) {
 	log.Printf("Fetched block %s from %s in %s", logEntry.BlockHash.Hex(), endpoint.URL, latency)
 
 	for _, tx := range block.Transactions() {
-		if _, exists := logEntry.TransactionHashes[tx.Hash()]; exists {
+		if tx.Hash() == logEntry.TransactionHash {
 
-			if tx.To() != nil && tx.To().Hex() == address {
-				blockInfo := BlockInfo{
+			sender, err := types.Sender(types.NewLondonSigner(sepoliaChainId), tx)
+			if err != nil {
+				log.Fatal("Not able to retrieve Tx sender:", err)
+				continue
+			}
+
+			if (tx.To() != nil && tx.To().Hex() == address) || (sender.Hex() == address) {
+				blockInfo := LogBlockInfo{
 					Time:             block.Time(),
+					Data:             logEntry.Data,
 					TransactionsRoot: block.TxHash(),
 					StateRoot:        block.Root(),
 					ReceiptsRoot:     block.ReceiptHash(),
 					BlockParentHash:  block.ParentHash(),
 				}
-				log.Printf("Storing block info for log index %s", logEntry.BlockHash.Hex())
+				log.Printf("Storing block info for log index %d", logEntry.BlockNumber)
 				storeBlockInfo(blockInfo)
 			}
 		}
 	}
 }
 
-func storeBlockInfo(blockInfo BlockInfo) {
+// Add to LevelDb
+func storeBlockInfo(logBlockInfo LogBlockInfo) {
 	blockInfoListMutex.Lock()
 	defer blockInfoListMutex.Unlock()
 
-	data, err := json.Marshal(blockInfo)
+	data, err := json.Marshal(logBlockInfo)
 	if err != nil {
 		log.Fatalf("Failed to marshal block info: %v", err)
 	}
@@ -203,7 +213,7 @@ func storeBlockInfo(blockInfo BlockInfo) {
 	if err != nil {
 		log.Fatalf("Failed to store block info in LevelDB: %v", err)
 	}
-	log.Printf("Stored block info with key %s: %+v", key, blockInfo)
+	log.Printf("Stored block info with key %s: %+v", key, logBlockInfo)
 }
 
 func getFastestClient() (*ethclient.Client, *Endpoint) {
