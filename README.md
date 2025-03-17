@@ -25,9 +25,4 @@ a destination (`to` field)
 
 In the affirmative, we store the log's data along with the corresponding block's time and block's parentHash in LevelDB.
 
-
-
-
-
-
-
+The index spread the load over 3 endpoints (Reth, Geth, Erigon) and always use the last fastest endpoint for the next queries.
