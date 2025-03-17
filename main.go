@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	startBlock = 7817858 // first block involving 0x761d53b47334bee6612c0bd1467fb881435375b2 in a tx
+	startBlock = 4789178 // first block involving 0x761d53b47334bee6612c0bd1467fb881435375b2 in a tx
 	endBlock   = 7920102 // latest block on sepolia at testing time
 	blockChunk = 10000
 	topic      = "0x3e54d0825ed78523037d00a81759237eb436ce774bd546993ee67a1b67b6e766"
